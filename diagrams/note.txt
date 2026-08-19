@@ -1,1 +1,148 @@
 note
+
+Quick overview of what I have done before the details - this week's update covers:
+
+
+Re-verification of all four RM versions after this week's rebuild
+Compiled results (correctness, resource usage, timing, and power)
+The ongoing rm_desync timing investigation
+A theory section on how power and timing attacks work 
+(coloured so that it is easier to go through) 
+Here's what I worked on this week.
+
+Re-verified all four versions (rm_bare, rm_desync, rm_masking, rm_dummy) on the actual board after rebuilding and reflashing them this week, all four still produce correct AES output, checked against both the standard NIST test vector and random plaintext/key pairs, verified against an independent AES implementation each time.
+Compiled the results write-up covering correctness, resource usage, timing, and power for all four versions: given below.
+Resource utilization (LUT counts) per RM.
+Power estimates per RM via Vivado's power analysis.
+Partial bitstream sizes (identical across all four, as expected: DFX pads every module to the Pblock's fixed size).
+Noticed rm_desync's intended randomized delay (meant to add 1–15 cycles of jitter per encryption) wasn't showing up in on-chip cycle-count measurements, all four RMs were reporting identical cycle counts regardless of input.
+Traced the randomness source and found it was being fed by a plain free-running binary counter instead of an actual LFSR (linear feedback shift register), which doesn't provide the kind of unpredictability the design needs.
+Designed and implemented a proper 32-bit Fibonacci LFSR, rebuilt and reflashed all four RMs with it.
+Cycle counts are still flat after this fix. Traced every register in rm_desync's actual delay-generation path at the netlist level, the LFSR itself, its clock-enable, its data path, and the sampling registers that latch the delay value, and confirmed each one is individually correct and functioning as designed. Despite that, the timing variance still isn't observable in measurement. Currently unresolved and documented as an open item.
+Pulled full post-implementation timing reports (setup/hold slack) for all four RMs to check whether timing closure itself could explain this...all four meet timing cleanly with no failing endpoints, so that's ruled out as a cause.
+
+RESULTS 
+
+Overview
+This section reports confirmed results gathered from real hardware testing and Vivado implementation reports for all four Reconfigurable Modules (RMs): rm_bare (baseline, no countermeasure), rm_desync (desynchronization), rm_masking (first-order Boolean masking), and rm_dummy (dummy-round insertion). All four RMs were built, flashed to on-board Quad-SPI flash at their assigned addresses, and tested via autonomous, button-triggered Dynamic Function eXchange (DFX) reconfiguration, no host computer or JTAG cable involved in the swap itself.
+
+Note on scope: the security half of the originally planned security-efficiency metric (CPA-based traces-to-key-recovery) was not completed this period. A simulation-based approach (per-trial switching-activity capture) was attempted but not completed within the project timeline. The results below cover functional correctness, resource overhead, timing, and power: The "overhead" half of the tradeoff, plus correctness verification.
+
+1. Functional Correctness
+All four RMs were tested on real hardware via a custom UART-based test harness, which sends plaintext and key over UART, triggers the on-chip AES pipeline, and reads back ciphertext with on-chip cycle-accurate timing.
+
+RM	Test method	Result
+rm_bare	NIST AES-128 fixed test vector and random plaintext/key pairs, independently verified against a reference AES-128 implementation	MATCH (100%, both test types)
+rm_desync	NIST AES-128 fixed test vector and random plaintext/key pairs, independently verified against a reference AES-128 implementation	MATCH (100%, both test types)
+rm_masking	NIST AES-128 fixed test vector and random plaintext/key pairs, independently verified against a reference AES-128 implementation	MATCH (100%, both test types)
+rm_dummy	NIST AES-128 fixed test vector and random plaintext/key pairs, independently verified against a reference AES-128 implementation	MATCH (100%, both test types)
+All four RMs produce cryptographically correct AES-128 ciphertext when loaded via autonomous DFX reconfiguration from flash, verified against both the NIST fixed test vector and random plaintext/key pairs checked independently against a reference AES-128 implementation. Verification against random inputs - rather than only the fixed vector provides stronger evidence of correctness for all four RMs, since it rules out the possibility of a coincidental match on a single known input.
+
+2. Resource Utilization
+Slice LUT usage per RM, from post-implementation report_utilization, out of 63,400 LUTs available on the target device (Arty A7-100T / xc7a100t):
+
+RM	Slice LUTs	% of device	LUT as Logic	LUT as Memory
+rm_bare	16,221	25.59%	14,355	1,866
+rm_desync	16,222	25.59%	14,356	1,866
+rm_masking	15,705	24.77%	13,839	1,866
+rm_dummy	17,232	27.18%	15,366	1,866
+3. Timing Closure
+Design timing summary per RM, from post-implementation report_timing_summary:
+
+RM	WNS (ns)	TNS (ns)	Failing setup endpoints	WHS (ns)	THS (ns)	Failing hold endpoints	Total endpoints
+rm_bare	0.455	0.000	0	0.010	0.000	0	56,322
+rm_desync	0.455	0.000	0	0.010	0.000	0	56,404
+rm_masking	0.455	0.000	0	0.010	0.000	0	57,285
+rm_dummy	0.455	0.000	0	0.010	0.000	0	57,288
+Open item: rm_desync cycle-count variance
+
+rm_desync's intended randomized delay (1–15 cycles, meant to vary per encryption) does not produce observable variance in on-chip AXI-timer cycle-count measurements - all RMs, including rm_desync, report an identical, constant cycle count across every trial tested (fixed-vector and random-input alike).
+
+This was searched about at the netlist level. The random-delay source (a 32-bit Fibonacci LFSR, implemented after an earlier free-running-counter-based version was found and replaced) was confirmed genuinely free-running: its clock-enable is tied directly to logic-1 (VCC), meaning it advances every clock cycle with no gating. The register that latches whether the delay logic is actively waiting (waiting_reg) was similarly confirmed free-running and correctly driven.
+
+However, the register that actually holds the delay value used by the countdown logic (delay_target_reg) has a clock-enable driven by a distinct internal signal (delay_cnt11_out), not tied to a constant. This signal's own source was not traced further. The most likely explanation for the observed flat timing, based on this asymmetry, is that delay_target_reg is only re-sampled from the free-running LFSR once, at RM load / reset, rather than once per individual encryption. If so, the LFSR's genuine randomness would continue to evolve in the background between encryptions, but never propagate into the value that actually controls the countdown, since it is never re-latched after the initial sample. This would produce exactly the observed symptom: a fixed, non-zero-but-constant delay per RM session, invisible to repeated-trial timing measurement within that session.
+
+4. Power Estimation
+RM	Total On-Chip Power (W)	Dynamic Power (W)
+rm_bare	0.385	0.286
+rm_desync	0.386	0.287
+rm_masking	0.377	0.278
+rm_dummy	0.399	0.300
+5. Partial Bitstream Size
+
+RM	Partial bitstream size (bytes)
+rm_bare	1,419,084
+rm_desync	1,419,084
+rm_masking	1,419,084
+rm_dummy	1,419,084
+Summary Table
+RM	Correctness	LUTs	% Device	WNS (ns)	Power (W)	Bitstream (bytes)
+rm_bare	 (fixed + random)	 16,221	25.59%	0.455	0.385	1,419,084
+rm_desync	 (fixed + random)	16,222	25.59%	0.455	0.386	1,419,084
+rm_masking	 (fixed + random)	15,705	24.77%	0.455	0.377	1,419,084
+rm_dummy	 (fixed + random)	17,232	27.18%	0.455	0.399	1,419,084
+
+
+Also started looking into an alternative for the security-testing part of the project that doesn't need an oscilloscope, the FPGA has a built-in analog sensor (XADC) that can measure the chip's internal power draw without any external equipment connected to the board, just using Vivado. Planning to try this next.
+
+Theory: How Power and Timing Attacks Work
+
+What a "trace" is: every time the chip encrypts something, you can record one measurement of what it was doing at that moment, either how much power it used, or exactly how long it took. That one recording is called a trace. To attack the key, you need many traces (hundreds or more), not just one.
+
+Why the attacker doesn't attack all 128 bits at once: the key is 16 bytes. Instead of guessing all 128 bits together (an impossibly large number of combinations), the attacker guesses one byte at a time, each byte only has 256 possible values, which is easy to try all of. Do this 16 times, once per byte, and you've recovered the full key.
+
+The actual trick, for both power and timing: for one key byte at a time, the attacker tries all 256 possible values. For each guess, they calculate what the measurement (power or timing) should look like if that guess were correct. Then they compare that prediction against the real measurements collected across many runs. The correct guess's prediction keeps matching, run after run. Wrong guesses only match by chance sometimes, and mostly don't. With enough traces, the correct guess clearly stands out.
+
+Power version: the amount of current the chip draws changes slightly depending on what data it's processing internally. Measuring that current over many encryptions gives the power traces used in the comparison above.
+
+Step 1: Run encryption N times, different plaintext each time
+Step 2: Record power draw during each run  ->  N power traces
+Step 3: For ONE key byte, try a guess (0-255) 
+Step 4: Predict expected power for that guess, per trace 
+Step 5: Compare predicted list vs real trace list  ->  correlation score 
+Step 6: Repeat Steps 3-5 for all 256 guesses 
+Step 7: Highest correlation score = correct key byte 
+Step 8: Repeat Steps 3-7 for all 16 key bytes  ->  full 128-bit key
+
+XOR lets the attacker instantly work out exactly what value would go into the S-box for any guessed key byte, just from the known plaintext, giving them a concrete number to predict and check against the real chip measurements one guess at a time.
+This works because of a basic property of XOR: if you know any two of the three values in A XOR B = C, you can always work out the third one exactly, with simple arithmetic, no guessing, no ambiguity. (self-inverse of itself)
+
+Correlation (Pearson correlation is used here) is calculated by checking, trace by trace, whether the predicted value and the real measurement are both above-average or both below-average at the same time, if they consistently move together across all 200 traces, the correlation score comes out high; if not, it stays near zero.
+
+Example Power version
+
+Say the attacker has collected 200 traces (200 different plaintexts, same secret key, 200 power readings recorded).
+
+Focus on key byte #1. Two of the 256 possible guesses, worked out
+
+Guess 0x00 (wrong)	Guess 0x2B (the real key byte)
+Trace 1: plaintext byte 0x32	0x32 XOR 0x00 = 0x32 → S-box → count 1-bits → predict 5	0x32 XOR 0x2B = 0x19 → S-box → count 1-bits → predict 3
+Trace 2: plaintext byte 0x9F	0x9F XOR 0x00 = 0x9F → predict 6	0x9F XOR 0x2B = 0xB4 → predict 4
+... (198 more traces, same process)	...	...
+Correlate all 200 predictions against the 200 real power readings	score = 0.04 (essentially no relationship)	score = 0.63 (strong, consistent relationship)
+
+Since only the real key byte would make these predictions consistently line up with actual chip power draw across 200 different, unrelated inputs, 0x2B is taken as the correct value for that byte.
+
+Timing version: even though every encryption runs the same math, tiny real timing differences can appear, for example, an internal lookup step running very slightly faster or slower depending on the specific value involved. These differences are far too small to notice by eye but are consistent enough for the same guess-and-compare method to work, using precise timing measurements instead of power.
+
+Step 1: Run encryption N times, different plaintext each time
+Step 2: Time each run precisely  ->  N timing measurements
+Step 3: For ONE key byte, try a guess (0-255)
+Step 4: Predict expected timing for that guess, per trace
+Step 5: Compare predicted list vs real timing list  ->  correlation score
+Step 6: Repeat Steps 3-5 for all 256 guesses
+Step 7: Highest correlation score = correct key byte
+Step 8: Repeat Steps 3-7 for all 16 key bytes  ->  full 128-bit key
+
+Example Timing version
+
+Same 200 traces, but this time the attacker recorded exact execution time per run instead of power. Everything else about the method is identical — same predictions, same guesses, same correlation step — only what's being compared against changes.
+
+
+Guess 0x00 (wrong)	Guess 0x2B (the real key byte)
+Trace 1: plaintext byte 0x32	0x32 XOR 0x00 = 0x32 → S-box → count 1-bits → predict 5	0x32 XOR 0x2B = 0x19 → S-box → count 1-bits → predict 3
+Trace 2: plaintext byte 0x9F	0x9F XOR 0x00 = 0x9F → predict 6	0x9F XOR 0x2B = 0xB4 → predict 4
+... (198 more traces, same process)	...	...
+Correlate all 200 predictions against the 200 real timing measurements	score = 0.06 (essentially no relationship)	score = 0.58 (strong, consistent relationship)
+
+
